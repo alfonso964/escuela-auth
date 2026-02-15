@@ -3,23 +3,38 @@ import NextAuth from "next-auth"
 import { PrismaAdapter } from "@auth/prisma-adapter"
 import prisma from "@/lib/prisma"
 import authConfig from "./auth.config"
+import bcrypt from "bcryptjs"
+import Credentials from "next-auth/providers/credentials"
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   adapter: PrismaAdapter(prisma),
   session: { strategy: "jwt" },
   
-  // Extendemos authConfig para permitir el enlazado de cuentas por email
   ...authConfig,
-  providers: authConfig.providers.map(provider => {
-    // Si no es el de credenciales, permitimos unir cuentas con el mismo email
-    if (provider.id !== "credentials") {
-      return {
+  providers: [
+    // 1. Mantenemos los proveedores sociales del config pero con el enlace de cuentas
+    ...authConfig.providers
+      .filter((provider) => provider.id !== "credentials")
+      .map(provider => ({
         ...provider,
         allowDangerousEmailAccountLinking: true,
-      }
-    }
-    return provider
-  }),
+      })),
+
+    // 2. Definimos aquí la lógica pesada de Credentials
+    Credentials({
+      async authorize(credentials) {
+        const { email, password } = credentials;
+        const user = await prisma.user.findUnique({ where: { email } });
+
+        if (!user || !user.password) return null;
+
+        const passwordsMatch = await bcrypt.compare(password, user.password);
+        if (passwordsMatch) return user;
+        
+        return null;
+      },
+    }),
+  ],
 
   pages: {
     signIn: '/auth/signin',
@@ -27,22 +42,20 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     error: '/auth/error',
     newUser: '/auth/register',
   },
+
   callbacks: {
     async jwt({ token, user, trigger, session }) {
-      // 1. Al iniciar sesión, el objeto 'user' viene de la base de datos o provider
       if (user) {
         token.role = user.role;
       } 
-      // 2. Si es una sesión activa pero el token no tiene el rol, lo recuperamos
       else if (!token.role && token.sub) {
         const dbUser = await prisma.user.findUnique({
           where: { id: token.sub },
           select: { role: true }
         });
-        token.role = dbUser?.role || 'USER'; // Valor por defecto para evitar errores
+        token.role = dbUser?.role || 'USER';
       }
 
-      // 3. Actualización manual de la sesión
       if (trigger === "update" && session) {
         if (session.name) token.name = session.name;
         if (session.role) token.role = session.role;
@@ -52,7 +65,6 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     },
 
     async session({ session, token }) {
-      // Inyectamos el ID y el Role en el objeto session que ve el cliente (Header, etc)
       if (session.user) {
         session.user.id = token.sub;
         session.user.role = token.role;
